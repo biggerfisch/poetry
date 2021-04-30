@@ -1,21 +1,11 @@
 from __future__ import unicode_literals
 
-import hashlib
 import os
-import re
-import shutil
-import stat
-import subprocess
-import sys
-import tarfile
+import site
 
 from functools import cmp_to_key
-from gzip import GzipFile
 from pathlib import Path
 from typing import TYPE_CHECKING
-from typing import Any
-from urllib.error import HTTPError
-from urllib.request import urlopen
 
 from cleo.helpers import argument
 from cleo.helpers import option
@@ -60,6 +50,9 @@ class SelfUpdateCommand(Command):
     REPOSITORY_URL = "https://github.com/python-poetry/poetry"
     BASE_URL = REPOSITORY_URL + "/releases/download"
 
+    _data_dir = None
+    _bin_dir = None
+
     @property
     def home(self) -> Path:
         from pathlib import Path
@@ -78,13 +71,46 @@ class SelfUpdateCommand(Command):
     def lib_backup(self) -> Path:
         return self.home / "lib-backup"
 
-    def handle(self) -> None:
+    @property
+    def data_dir(self) -> Path:
+        if self._data_dir is not None:
+            return self._data_dir
+
+        from poetry.locations import user_data_dir
+
+        if os.getenv("POETRY_HOME"):
+            return Path(os.getenv("POETRY_HOME")).expanduser()
+
+        self._data_dir = Path(user_data_dir("pypoetry", roaming=True))
+
+        return self._data_dir
+
+    @property
+    def bin_dir(self) -> Path:
+        if self._data_dir is not None:
+            return self._data_dir
+
+        from poetry.utils._compat import WINDOWS
+
+        if os.getenv("POETRY_HOME"):
+            return Path(os.getenv("POETRY_HOME"), "bin").expanduser()
+
+        user_base = site.getuserbase()
+
+        if WINDOWS:
+            bin_dir = os.path.join(user_base, "Scripts")
+        else:
+            bin_dir = os.path.join(user_base, "bin")
+
+        self._bin_dir = Path(bin_dir)
+
+        return self._bin_dir
+
+    def handle(self) -> int:
         from poetry.__version__ import __version__
         from poetry.core.packages.dependency import Dependency
         from poetry.core.semver.version import Version
         from poetry.repositories.pypi_repository import PyPiRepository
-
-        self._check_recommended_installation()
 
         version = self.argument("version")
         if not version:
@@ -96,7 +122,7 @@ class SelfUpdateCommand(Command):
         )
         if not packages:
             self.line("No release found for the specified version")
-            return
+            return 1
 
         packages.sort(
             key=cmp_to_key(
@@ -122,41 +148,15 @@ class SelfUpdateCommand(Command):
 
         if release is None:
             self.line("No new release found")
-            return
+            return 1
 
         if release.version == Version.parse(__version__):
             self.line("You are using the latest version")
-            return
+            return 0
 
-        self.update(release)
-
-    def update(self, release: "Package") -> None:
-        version = release.version
         self.line("Updating to <info>{}</info>".format(version))
 
-        if self.lib_backup.exists():
-            shutil.rmtree(str(self.lib_backup))
-
-        # Backup the current installation
-        if self.lib.exists():
-            shutil.copytree(str(self.lib), str(self.lib_backup))
-            shutil.rmtree(str(self.lib))
-
-        try:
-            self._update(version)
-        except Exception:
-            if not self.lib_backup.exists():
-                raise
-
-            shutil.copytree(str(self.lib_backup), str(self.lib))
-            shutil.rmtree(str(self.lib_backup))
-
-            raise
-        finally:
-            if self.lib_backup.exists():
-                shutil.rmtree(str(self.lib_backup))
-
-        self.make_bin()
+        self.update(release)
 
         self.line("")
         self.line("")
@@ -166,161 +166,42 @@ class SelfUpdateCommand(Command):
             )
         )
 
+    def update(self, release: "Package") -> None:
+        from poetry.utils.env import EnvManager
+
+        version = release.version
+
+        env = EnvManager.get_system_env()
+
+        if env.path.is_relative_to(self.data_dir):
+            # Poetry was installed using the recommended installer
+            self._update(version)
+
+            return 0
+        else:
+            # Another method was used to install Poetry so we try to install via pip
+            env.run_pip("install", f"poetry=={release.version.text}", "-U")
+
     def _update(self, version: "Version") -> None:
-        from poetry.utils.helpers import temporary_directory
+        from poetry.config.config import Config
+        from poetry.core.packages.dependency import Dependency
+        from poetry.core.packages.project_package import ProjectPackage
+        from poetry.installation.installer import Installer
+        from poetry.repositories.installed_repository import InstalledRepository
+        from poetry.repositories.pool import Pool
+        from poetry.repositories.pypi_repository import PyPiRepository
+        from poetry.utils.env import EnvManager
 
-        release_name = self._get_release_name(version)
+        root = ProjectPackage("__root__", "0.0.0")
+        root.add_dependency(Dependency("poetry", version.text))
 
-        checksum = "{}.sha256sum".format(release_name)
+        env = EnvManager.get_system_env()
 
-        base_url = self.BASE_URL
+        pool = Pool()
+        pool.add_repository(PyPiRepository(fallback=False))
 
-        try:
-            r = urlopen(base_url + "/{}/{}".format(version, checksum))
-        except HTTPError as e:
-            if e.code == 404:
-                raise RuntimeError("Could not find {} file".format(checksum))
-
-            raise
-
-        checksum = r.read().decode().strip()
-
-        # We get the payload from the remote host
-        name = "{}.tar.gz".format(release_name)
-        try:
-            r = urlopen(base_url + "/{}/{}".format(version, name))
-        except HTTPError as e:
-            if e.code == 404:
-                raise RuntimeError("Could not find {} file".format(name))
-
-            raise
-
-        meta = r.info()
-        size = int(meta["Content-Length"])
-        current = 0
-        block_size = 8192
-
-        bar = self.progress_bar(max=size)
-        bar.set_format(" - Downloading <info>{}</> <comment>%percent%%</>".format(name))
-        bar.start()
-
-        sha = hashlib.sha256()
-        with temporary_directory(prefix="poetry-updater-") as dir_:
-            tar = os.path.join(dir_, name)
-            with open(tar, "wb") as f:
-                while True:
-                    buffer = r.read(block_size)
-                    if not buffer:
-                        break
-
-                    current += len(buffer)
-                    f.write(buffer)
-                    sha.update(buffer)
-
-                    bar.set_progress(current)
-
-            bar.finish()
-
-            # Checking hashes
-            if checksum != sha.hexdigest():
-                raise RuntimeError(
-                    "Hashes for {} do not match: {} != {}".format(
-                        name, checksum, sha.hexdigest()
-                    )
-                )
-
-            gz = GzipFile(tar, mode="rb")
-            try:
-                with tarfile.TarFile(tar, fileobj=gz, format=tarfile.PAX_FORMAT) as f:
-                    f.extractall(str(self.lib))
-            finally:
-                gz.close()
-
-    def process(self, *args: Any) -> str:
-        return subprocess.check_output(list(args), stderr=subprocess.STDOUT)
-
-    def _check_recommended_installation(self) -> None:
-        from pathlib import Path
-
-        from poetry.console.exceptions import PoetrySimpleConsoleException
-
-        current = Path(__file__)
-        try:
-            current.relative_to(self.home)
-        except ValueError:
-            raise PoetrySimpleConsoleException(
-                "Poetry was not installed with the recommended installer, "
-                "so it cannot be updated automatically."
-            )
-
-    def _get_release_name(self, version: "Version") -> str:
-        platform = sys.platform
-        if platform == "linux2":
-            platform = "linux"
-
-        return "poetry-{}-{}".format(version, platform)
-
-    def make_bin(self) -> None:
-        from poetry.utils._compat import WINDOWS
-
-        self.bin.mkdir(0o755, parents=True, exist_ok=True)
-
-        python_executable = self._which_python()
-
-        if WINDOWS:
-            with self.bin.joinpath("poetry.bat").open("w", newline="") as f:
-                f.write(
-                    BAT.format(
-                        python_executable=python_executable,
-                        poetry_bin=str(self.bin / "poetry").replace(
-                            os.environ["USERPROFILE"], "%USERPROFILE%"
-                        ),
-                    )
-                )
-
-        bin_content = BIN
-        if not WINDOWS:
-            bin_content = "#!/usr/bin/env {}\n".format(python_executable) + bin_content
-
-        self.bin.joinpath("poetry").write_text(bin_content, encoding="utf-8")
-
-        if not WINDOWS:
-            # Making the file executable
-            st = os.stat(str(self.bin.joinpath("poetry")))
-            os.chmod(str(self.bin.joinpath("poetry")), st.st_mode | stat.S_IEXEC)
-
-    def _which_python(self) -> str:
-        """
-        Decides which python executable we'll embed in the launcher script.
-        """
-        from poetry.utils._compat import WINDOWS
-
-        allowed_executables = ["python", "python3"]
-        if WINDOWS:
-            allowed_executables += ["py.exe -3", "py.exe -2"]
-
-        # \d in regex ensures we can convert to int later
-        version_matcher = re.compile(r"^Python (?P<major>\d+)\.(?P<minor>\d+)\..+$")
-        fallback = None
-        for executable in allowed_executables:
-            try:
-                raw_version = subprocess.check_output(
-                    executable + " --version", stderr=subprocess.STDOUT, shell=True
-                ).decode("utf-8")
-            except subprocess.CalledProcessError:
-                continue
-
-            match = version_matcher.match(raw_version.strip())
-            if match and tuple(map(int, match.groups())) >= (3, 0):
-                # favor the first py3 executable we can find.
-                return executable
-
-            if fallback is None:
-                # keep this one as the fallback; it was the first valid executable we found.
-                fallback = executable
-
-        if fallback is None:
-            # Avoid breaking existing scripts
-            fallback = "python"
-
-        return fallback
+        installer = Installer(
+            self.io, env, None, pool, Config(), installed=InstalledRepository.load()
+        )
+        installer.update(True)
+        installer.dry_run(True)
